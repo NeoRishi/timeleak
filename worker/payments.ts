@@ -28,7 +28,6 @@ type CheckoutDependencies = {
     metadata: Record<string, string>
     return_url: string
     cancel_url: string
-    confirm: true
   }) => Promise<SessionResponse>
 }
 
@@ -93,7 +92,6 @@ export async function createCheckout(env: PaymentEnvironment, input: CheckoutInp
     metadata: { convex_user_id: input.userId, product: 'timeleak_30_day_pass' },
     return_url: input.returnUrl,
     cancel_url: input.returnUrl.replace('checkout=return', 'checkout=cancelled'),
-    confirm: true as const,
   }
   const createSession = dependencies.createDodoSession ?? (async (body: typeof request) => {
     const { default: DodoPayments } = await import('dodopayments')

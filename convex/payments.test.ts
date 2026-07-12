@@ -88,6 +88,30 @@ describe('Phase 6 Dodo payment lifecycle', () => {
     expect(payment).toMatchObject({ status: 'paid', paidAt, refundDeadline: paidAt + 7 * DAY })
   })
 
+  it('binds a hosted checkout session to the provider payment on success', async () => {
+    const t = convexTest(schema, modules)
+    const { userId } = await createUser(t)
+    await t.mutation(api.payments.createPendingPayment, {
+      userId,
+      providerPaymentId: 'session:cks_hosted_1',
+      checkoutSessionId: 'cks_hosted_1',
+      customerEmail: 'buyer@example.com',
+      amountUsdCents: 999,
+      mode: 'live',
+    })
+
+    await t.mutation(api.payments.processPaymentSucceeded, {
+      userId,
+      providerPaymentId: 'pay_live_hosted_1',
+      serverSecret: INTERNAL_SECRET,
+      webhookId: 'wh_live_hosted_1',
+      paidAt: Date.UTC(2026, 6, 13),
+    })
+
+    const payment = await t.run((ctx) => ctx.db.query('payments').withIndex('by_provider_payment', (q) => q.eq('providerPaymentId', 'pay_live_hosted_1')).unique())
+    expect(payment).toMatchObject({ userId, status: 'paid', checkoutSessionId: 'cks_hosted_1' })
+  })
+
   it('rejects direct webhook lifecycle mutations without the server secret', async () => {
     const t = convexTest(schema, modules)
     const { userId } = await createUser(t)

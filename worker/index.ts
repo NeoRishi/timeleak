@@ -126,6 +126,9 @@ export default {
         if (event.type === 'payment.succeeded') {
           await convex.mutation(api.payments.processPaymentSucceeded, {
             providerPaymentId: event.data.payment_id,
+            userId: typeof event.data.metadata?.convex_user_id === 'string'
+              ? event.data.metadata.convex_user_id as Id<'users'>
+              : undefined,
             webhookId,
             serverSecret: env.PAYMENT_INTERNAL_SECRET,
             paidAt: Date.parse(event.timestamp),
@@ -133,6 +136,9 @@ export default {
         } else if (event.type === 'payment.failed') {
           await convex.mutation(api.payments.processPaymentFailed, {
             providerPaymentId: event.data.payment_id,
+            userId: typeof event.data.metadata?.convex_user_id === 'string'
+              ? event.data.metadata.convex_user_id as Id<'users'>
+              : undefined,
             webhookId,
             serverSecret: env.PAYMENT_INTERNAL_SECRET,
           })

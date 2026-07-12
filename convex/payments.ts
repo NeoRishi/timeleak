@@ -42,11 +42,22 @@ async function alreadyProcessed(ctx: MutationCtx, webhookId: string) {
 }
 
 export const processPaymentSucceeded = mutation({
-  args: { providerPaymentId: v.string(), webhookId: v.string(), paidAt: v.number(), serverSecret: v.string() },
+  args: {
+    providerPaymentId: v.string(),
+    userId: v.optional(v.id('users')),
+    webhookId: v.string(),
+    paidAt: v.number(),
+    serverSecret: v.string(),
+  },
   handler: async (ctx, args) => {
     assertServerSecret(args.serverSecret)
     if (await alreadyProcessed(ctx, args.webhookId)) return { processed: false as const, duplicate: true as const }
-    const payment = await ctx.db.query('payments').withIndex('by_provider_payment', (q) => q.eq('providerPaymentId', args.providerPaymentId)).unique()
+    let payment = await ctx.db.query('payments').withIndex('by_provider_payment', (q) => q.eq('providerPaymentId', args.providerPaymentId)).unique()
+    if (!payment && args.userId) {
+      const userPayments = await ctx.db.query('payments').withIndex('by_user', (q) => q.eq('userId', args.userId!)).order('desc').collect()
+      payment = userPayments.find((candidate) => candidate.status === 'pending') ?? null
+      if (payment) await ctx.db.patch(payment._id, { providerPaymentId: args.providerPaymentId })
+    }
     if (!payment) throw new ConvexError('PAYMENT_NOT_FOUND')
     if (payment.status === 'paid' || payment.status === 'refunded') {
       await ctx.db.insert('paymentWebhookEvents', {
@@ -72,11 +83,16 @@ export const processPaymentSucceeded = mutation({
 })
 
 export const processPaymentFailed = mutation({
-  args: { providerPaymentId: v.string(), webhookId: v.string(), serverSecret: v.string() },
+  args: { providerPaymentId: v.string(), userId: v.optional(v.id('users')), webhookId: v.string(), serverSecret: v.string() },
   handler: async (ctx, args) => {
     assertServerSecret(args.serverSecret)
     if (await alreadyProcessed(ctx, args.webhookId)) return { processed: false as const, duplicate: true as const }
-    const payment = await ctx.db.query('payments').withIndex('by_provider_payment', (q) => q.eq('providerPaymentId', args.providerPaymentId)).unique()
+    let payment = await ctx.db.query('payments').withIndex('by_provider_payment', (q) => q.eq('providerPaymentId', args.providerPaymentId)).unique()
+    if (!payment && args.userId) {
+      const userPayments = await ctx.db.query('payments').withIndex('by_user', (q) => q.eq('userId', args.userId!)).order('desc').collect()
+      payment = userPayments.find((candidate) => candidate.status === 'pending') ?? null
+      if (payment) await ctx.db.patch(payment._id, { providerPaymentId: args.providerPaymentId })
+    }
     if (!payment) throw new ConvexError('PAYMENT_NOT_FOUND')
     if (payment.status === 'pending') await ctx.db.patch(payment._id, { status: 'failed' })
     await ctx.db.insert('paymentWebhookEvents', {

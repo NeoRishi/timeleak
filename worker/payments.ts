@@ -23,7 +23,8 @@ type CheckoutDependencies = {
   persist: (payment: PendingPayment) => Promise<unknown>
   createDodoSession?: (request: {
     product_cart: Array<{ product_id: string; quantity: number }>
-    customer: { email: string }
+    customer: { email: string; name: string }
+    feature_flags: { allow_customer_editing_name: true }
     metadata: Record<string, string>
     return_url: string
     cancel_url: string
@@ -84,9 +85,11 @@ export async function createCheckout(env: PaymentEnvironment, input: CheckoutInp
   }
 
   const mode = env.DODO_PAYMENTS_MODE === 'live' ? 'live' as const : 'test' as const
+  const customerName = email.split('@')[0].replace(/[._-]+/g, ' ').trim() || 'TimeLeak customer'
   const request = {
     product_cart: [{ product_id: env.DODO_PAYMENTS_PRODUCT_ID!, quantity: 1 }],
-    customer: { email },
+    customer: { email, name: customerName.slice(0, 80) },
+    feature_flags: { allow_customer_editing_name: true as const },
     metadata: { convex_user_id: input.userId, product: 'timeleak_30_day_pass' },
     return_url: input.returnUrl,
     cancel_url: input.returnUrl.replace('checkout=return', 'checkout=cancelled'),

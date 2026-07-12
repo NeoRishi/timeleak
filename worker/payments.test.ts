@@ -44,7 +44,8 @@ describe('Phase 6 Dodo checkout adapter', () => {
 
     expect(createDodoSession).toHaveBeenCalledWith(expect.objectContaining({
       product_cart: [{ product_id: 'pdt_timeleak', quantity: 1 }],
-      customer: { email: 'buyer@example.com' },
+      customer: { email: 'buyer@example.com', name: 'buyer' },
+      feature_flags: { allow_customer_editing_name: true },
       metadata: { convex_user_id: 'user_123', product: 'timeleak_30_day_pass' },
       return_url: input.returnUrl,
     }))

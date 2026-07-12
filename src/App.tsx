@@ -12,6 +12,18 @@ import {
   type PriorityCategory,
   type ScheduleMethod,
 } from './onboarding'
+import {
+  createCalendarFile,
+  createPublicSharePayload,
+  downloadTextFile,
+  loadSavedResult,
+  saveResult,
+} from './result'
+import {
+  runTimeLeakPipeline,
+  type PipelineExecution,
+  type PipelineInput,
+} from './timeleakPipeline'
 import './App.css'
 
 export type InstrumentationEvent =
@@ -35,11 +47,13 @@ export type OnboardingBackend = {
     userId?: string,
     sessionId?: string,
   ) => Promise<unknown>
+  analyze: (input: PipelineInput) => Promise<PipelineExecution>
 }
 
 const offlineBackend: OnboardingBackend = {
   createUser: async () => ({ userId: 'local-preview', created: true }),
   trackEvent: async () => undefined,
+  analyze: (input) => runTimeLeakPipeline(input),
 }
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -56,6 +70,7 @@ function App({ backend = offlineBackend }: { backend?: OnboardingBackend }) {
   const [state, setState] = useState<OnboardingState>(() => loadOnboardingState())
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [analysis, setAnalysis] = useState<Pick<PipelineExecution, 'result' | 'repairedBlocks'> | null>(() => loadSavedResult())
   const parsedSchedule = useMemo(
     () => parseSchedule(state.pastedSchedule),
     [state.pastedSchedule],
@@ -171,11 +186,44 @@ function App({ backend = offlineBackend }: { backend?: OnboardingBackend }) {
       setError('Describe one outcome for tomorrow.')
       return
     }
-    update({ priorityText: state.priorityText.trim(), step: 5 })
-    await record('priority_submitted', {
-      category: state.priorityCategory,
-      minimumMinutes: state.priorityMinimumMinutes,
-    })
+
+    setBusy(true)
+    try {
+      const priorityText = state.priorityText.trim()
+      await record('priority_submitted', {
+        category: state.priorityCategory,
+        minimumMinutes: state.priorityMinimumMinutes,
+      })
+      const localDate = state.scheduleMethod === 'demo'
+        ? '2026-07-13'
+        : new Date(Date.now() + 86_400_000).toISOString().slice(0, 10)
+      const scheduleBlocks = state.scheduleEvents.map((block) => ({
+        start: block.start,
+        end: block.end,
+        title: block.title,
+        category: block.category as PipelineInput['scheduleBlocks'][number]['category'],
+        flexible: block.movable,
+        source: block.source,
+      }))
+      const execution = await backend.analyze({
+        timezone: state.scheduleMethod === 'demo' ? 'Asia/Kolkata' : (Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'),
+        localDate,
+        sleepInterval: { start: state.sleepStart, end: state.wakeTime },
+        scheduleBlocks,
+        intentionalRestBlocks: scheduleBlocks.filter((block) => block.category === 'intentional_rest'),
+        priority: priorityText,
+        minimumUsefulMinutes: state.priorityMinimumMinutes,
+        plannedDays: 22,
+      })
+      const saved = { result: execution.result, repairedBlocks: execution.repairedBlocks }
+      saveResult(saved)
+      setAnalysis(saved)
+      update({ priorityText, step: 5 })
+    } catch {
+      setError('We could not analyze your day. Please try again.')
+    } finally {
+      setBusy(false)
+    }
   }
 
   function goBack() {
@@ -186,6 +234,8 @@ function App({ backend = offlineBackend }: { backend?: OnboardingBackend }) {
   function restart() {
     const fresh = initialOnboardingState()
     setState(fresh)
+    setAnalysis(null)
+    localStorage.removeItem('timeleak.result.v1')
     setError('')
   }
 
@@ -329,27 +379,126 @@ function App({ backend = offlineBackend }: { backend?: OnboardingBackend }) {
                 </div>
               </fieldset>
               <ErrorMessage message={error} />
-              <FlowActions onBack={goBack} submitLabel="Finish onboarding" />
+              <FlowActions onBack={goBack} busy={busy} submitLabel="Find my TimeLeak" />
             </form>
           )}
 
-          {state.step === 5 && (
-            <div className="question-panel completion-panel">
-              <span className="completion-check" aria-hidden="true">✓</span>
-              <p className="question-kicker">Inputs complete</p>
-              <h1>Ready to find your TimeLeak.</h1>
-              <p className="question-copy">Your day is mapped, your sleep is protected, and one priority is ready for analysis.</p>
-              <dl className="summary-list">
-                <div><dt>Schedule</dt><dd>{state.scheduleMethod === 'demo' ? 'Monday demo' : `${state.scheduleEvents.length} pasted events`}</dd></div>
-                <div><dt>Sleep</dt><dd>{formatClock(state.sleepStart)}–{formatClock(state.wakeTime)}</dd></div>
-                <div><dt>Priority</dt><dd>{state.priorityCategory} · {state.priorityMinimumMinutes} minutes</dd></div>
-              </dl>
-              <button className="back-button" type="button" onClick={() => update({ step: 4 })}>Edit answers</button>
-            </div>
-          )}
+          {state.step === 5 && analysis && <ResultView analysis={analysis} />}
         </section>
       )}
     </main>
+  )
+}
+
+function ResultView({ analysis }: { analysis: Pick<PipelineExecution, 'result' | 'repairedBlocks'> }) {
+  const { result, repairedBlocks } = analysis
+  const [copyStatus, setCopyStatus] = useState('')
+  const summary = result.daySummary
+  const allocation = [
+    ['Sleep', summary.sleepMinutes, 'sleep'],
+    ['Fixed', summary.fixedMinutes, 'fixed'],
+    ['Maintenance', summary.maintenanceMinutes, 'maintenance'],
+    ['Intentional rest', summary.intentionalRestMinutes, 'rest'],
+    ['Unowned', summary.unownedMinutes, 'unowned'],
+  ] as const
+  const calendar = result.calendarEvent
+
+  function downloadCalendar() {
+    const file = createCalendarFile(result)
+    downloadTextFile(file.filename, file.mimeType, file.content)
+  }
+
+  async function copyShare() {
+    const share = createPublicSharePayload(result)
+    const text = `My ${share.leakLabel} became ${share.afterMinutes} protected minutes tomorrow — ${share.monthlyHours} hours across the next month. Find your TimeLeak.`
+    await navigator.clipboard.writeText(text)
+    setCopyStatus('Copied — private schedule details were excluded.')
+  }
+
+  return (
+    <article className="result-page">
+      <header className="result-hero">
+        <p className="result-overline">Your tomorrow repair is ready</p>
+        <h1>We found your TimeLeak.</h1>
+        <p>{result.leak.explanation}</p>
+      </header>
+
+      <section className="result-section allocation-section" aria-labelledby="allocation-title">
+        <div className="section-heading"><span>01</span><h2 id="allocation-title">24-hour allocation</h2></div>
+        <div className="allocation-bar" aria-label="24-hour allocation bar">
+          {allocation.map(([label, value, className]) => value > 0 && (
+            <span key={label} className={className} style={{ width: `${(value / 1440) * 100}%` }} title={`${label}: ${value} minutes`} />
+          ))}
+        </div>
+        <div className="allocation-legend">
+          {allocation.map(([label, value, className]) => <span key={label}><i className={className} />{label} <strong>{Math.round(value / 60 * 10) / 10}h</strong></span>)}
+        </div>
+      </section>
+
+      <section className="result-section insight-grid">
+        <div className="insight-card leak-card">
+          <p className="card-label">Biggest leak</p>
+          <h2>{result.leak.label}</h2>
+          <p>{result.leak.explanation}</p>
+          <span className="confidence">{Math.round(result.leak.confidence * 100)}% confidence</span>
+        </div>
+        <div className="insight-card repair-card">
+          <p className="card-label">One repair</p>
+          <h2>{result.repair.headline}</h2>
+          <p>{result.repair.instruction}</p>
+          <span className="preserved">Sleep and intentional rest preserved</span>
+        </div>
+      </section>
+
+      <section className="result-section metric-strip">
+        <div>
+          <p>Protected Priority Time</p>
+          <div className="before-after"><strong>{result.metrics.beforeProtectedMinutes}</strong><span>→</span><strong>{result.metrics.afterProtectedMinutes}</strong><small>minutes tomorrow</small></div>
+        </div>
+        <div>
+          <p>Monthly Reclaim Potential</p>
+          <strong className="monthly-number">{result.shareResult.monthlyHours}</strong><span className="monthly-unit"> protected hours</span>
+          <small>{result.metrics.plannedDays} planned days × {result.metrics.afterProtectedMinutes - result.metrics.beforeProtectedMinutes} minutes</small>
+        </div>
+      </section>
+
+      <section className="result-section comparison-section">
+        <div className="section-heading"><span>02</span><h2>Current versus repaired tomorrow</h2></div>
+        <div className="comparison-grid">
+          <div className="day-card current-day"><p>Current</p><strong>8:10–9:30 PM</strong><span>Drift and scattered chores</span></div>
+          <div className="repair-arrow" aria-hidden="true">→</div>
+          <div className="day-card repaired-day"><p>Repaired</p><strong>{calendar ? `${calendar.start.slice(11, 16)}–${calendar.end.slice(11, 16)}` : 'Protected block'}</strong><span>{result.repair.headline}</span></div>
+        </div>
+        <p className="smallest-change">{result.repair.whySmallestChange}</p>
+      </section>
+
+      <section className="result-section action-list">
+        <div className="action-row">
+          <div><p className="card-label">Download calendar block</p><h2>{calendar?.title}</h2><span>Ready to add to your calendar.</span></div>
+          <button type="button" className="result-button" onClick={downloadCalendar}>Download .ics file</button>
+        </div>
+        <div className="action-row disabled-action">
+          <div><p className="card-label">Tomorrow Briefing</p><h2>Hear your repair in 30 seconds</h2><span>Available when dynamic audio is connected.</span></div>
+          <button type="button" className="result-button secondary" disabled>Play briefing</button>
+        </div>
+        <div className="action-row share-row">
+          <div><p className="card-label">Privacy-safe share card</p><h2>{result.shareResult.afterMinutes} minutes tomorrow · {result.shareResult.monthlyHours} hours next month</h2><span>Only reclaimed metrics and the public leak label are shared.</span>{copyStatus && <em role="status">{copyStatus}</em>}</div>
+          <button type="button" className="result-button secondary" onClick={copyShare}>Copy share text</button>
+        </div>
+      </section>
+
+      <section className="offer-card">
+        <div>
+          <p className="offer-kicker">30-Day Time Reclaim Pass</p>
+          <h2>One repaired day shows the opportunity. Protect the next 30 days.</h2>
+          <p>Daily change-only check-ins, one calendar-ready repair, and weekly reclaimed-hours evidence.</p>
+          <small>Immediate access. Cancel within seven days for a full refund.</small>
+        </div>
+        <div className="offer-action"><strong>$9.99</strong><span>one-time payment</span><button type="button">Start 30-Day Time Reclaim — $9.99</button></div>
+      </section>
+
+      {repairedBlocks.length > 0 && <p className="result-footnote">Repair checked against {repairedBlocks.length} non-overlapping blocks.</p>}
+    </article>
   )
 }
 

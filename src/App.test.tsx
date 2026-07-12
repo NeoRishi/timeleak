@@ -3,12 +3,14 @@ import '@testing-library/jest-dom/vitest'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { MONDAY_PIPELINE_INPUT, runTimeLeakPipeline } from './timeleakPipeline'
 import App, { type OnboardingBackend } from './App'
 
 function createBackend() {
   return {
     createUser: vi.fn().mockResolvedValue({ userId: 'user-1', created: true }),
     trackEvent: vi.fn().mockResolvedValue(undefined),
+    analyze: vi.fn().mockImplementation(() => runTimeLeakPipeline(MONDAY_PIPELINE_INPUT)),
   } satisfies OnboardingBackend
 }
 
@@ -110,9 +112,9 @@ describe('Phase 3 onboarding', () => {
       'Complete one AI course module',
     )
     await userEvent.click(screen.getByRole('button', { name: '60 minutes' }))
-    await userEvent.click(screen.getByRole('button', { name: 'Finish onboarding' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Find my TimeLeak' }))
 
-    expect(await screen.findByText('Ready to find your TimeLeak.')).toBeInTheDocument()
+    expect(await screen.findByText('We found your TimeLeak.')).toBeInTheDocument()
     expect(performance.now() - startedAt).toBeLessThan(45_000)
 
     await waitFor(() => {
@@ -129,5 +131,59 @@ describe('Phase 3 onboarding', () => {
         ]),
       )
     })
+  })
+
+  it('renders the result in payment-earning order and restores it after refresh', async () => {
+    const createObjectUrl = vi.fn().mockReturnValue('blob:calendar')
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectUrl })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const backend = createBackend()
+    const first = render(<App backend={backend} />)
+    await startOnboarding()
+    await completeEmail()
+    await completeSleep()
+    await userEvent.click(screen.getByRole('button', { name: 'Use the Monday demo' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Learning' }))
+    await userEvent.type(screen.getByLabelText('What would make tomorrow meaningful?'), 'Complete one AI course module')
+    await userEvent.click(screen.getByRole('button', { name: '60 minutes' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Find my TimeLeak' }))
+
+    expect(await screen.findByRole('heading', { name: 'We found your TimeLeak.' })).toBeInTheDocument()
+    const orderedLabels = [
+      '24-hour allocation',
+      'Biggest leak',
+      'One repair',
+      'Protected Priority Time',
+      'Monthly Reclaim Potential',
+      'Current versus repaired tomorrow',
+      'Download calendar block',
+      'Tomorrow Briefing',
+      'Privacy-safe share card',
+      '30-Day Time Reclaim Pass',
+    ]
+    const positions = orderedLabels.map((label) => document.body.textContent?.indexOf(label) ?? -1)
+    expect(positions.every((position) => position >= 0)).toBe(true)
+    expect(positions).toEqual([...positions].sort((a, b) => a - b))
+    expect(screen.getByRole('button', { name: 'Download .ics file' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Copy share text' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start 30-Day Time Reclaim — $9.99' })).toBeInTheDocument()
+    expect(screen.getByText('Ready to add to your calendar.')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Download .ics file' }))
+    expect(createObjectUrl).toHaveBeenCalledWith(expect.any(Blob))
+    await userEvent.click(screen.getByRole('button', { name: 'Copy share text' }))
+    expect(writeText).toHaveBeenCalledOnce()
+    const sharedText = String(writeText.mock.calls[0][0])
+    expect(sharedText).not.toContain('AI course')
+    expect(sharedText).not.toContain('8:30')
+    expect(await screen.findByRole('status')).toHaveTextContent('private schedule details were excluded')
+
+    first.unmount()
+    render(<App backend={backend} />)
+    expect(await screen.findByRole('heading', { name: 'We found your TimeLeak.' })).toBeInTheDocument()
   })
 })

@@ -21,6 +21,43 @@ export const startAnalysis = mutation({
   },
 })
 
+export const logAgentRun = mutation({
+  args: {
+    analysisId: v.id('analyses'),
+    stage: v.string(),
+    status: v.union(v.literal('started'), v.literal('passed'), v.literal('failed'), v.literal('revised')),
+    latencyMs: v.optional(v.number()),
+    errorCode: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    if (!(await ctx.db.get(args.analysisId))) throw new ConvexError('ANALYSIS_NOT_FOUND')
+    return ctx.db.insert('agentRuns', { ...args, createdAt: Date.now() })
+  },
+})
+
+export const limitAnalysis = mutation({
+  args: {
+    analysisId: v.id('analyses'),
+    resultJson: v.string(),
+    errorCode: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const analysis = await ctx.db.get(args.analysisId)
+    if (!analysis) throw new ConvexError('ANALYSIS_NOT_FOUND')
+    if (analysis.status !== 'running') throw new ConvexError('ANALYSIS_NOT_RUNNING')
+    const completedAt = Date.now()
+    await ctx.db.patch(args.analysisId, { status: 'limited', resultJson: args.resultJson, completedAt })
+    await ctx.db.insert('agentRuns', {
+      analysisId: args.analysisId,
+      stage: 'pipeline',
+      status: 'failed',
+      errorCode: args.errorCode,
+      createdAt: completedAt,
+    })
+    return args.analysisId
+  },
+})
+
 export const completeAnalysis = mutation({
   args: {
     analysisId: v.id('analyses'),

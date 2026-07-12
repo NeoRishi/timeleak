@@ -1,8 +1,10 @@
 import { ConvexHttpClient } from 'convex/browser'
 import { api } from '../convex/_generated/api.js'
 import type { Id } from '../convex/_generated/dataModel.js'
-import { runTimeLeakPipeline, type PipelineInput } from '../src/timeleakPipeline.js'
+import { runTimeLeakPipeline, validateAnalysisResult, type PipelineInput, type TimeLeakAnalysis } from '../src/timeleakPipeline.js'
 import { createCheckout, type PaymentEnvironment } from './payments.js'
+import { createBriefingAudio, transcribeScheduleAudio } from './elevenlabs.js'
+import { interpretScheduleTranscript } from './openaiSchedule.js'
 
 function isPipelineInput(value: unknown): value is PipelineInput {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
@@ -21,7 +23,17 @@ function isPipelineInput(value: unknown): value is PipelineInput {
     && typeof input.plannedDays === 'number'
 }
 
-type WorkerEnvironment = Env & PaymentEnvironment
+type WorkerEnvironment = Env & PaymentEnvironment & {
+  ELEVENLABS_API_KEY?: string
+  ELEVENLABS_VOICE_ID?: string
+  OPENAI_API_KEY?: string
+}
+
+async function analysisCacheId(result: TimeLeakAnalysis) {
+  const bytes = new TextEncoder().encode(JSON.stringify(result))
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('')
+}
 
 function convexClient(env: WorkerEnvironment) {
   const url = env.CONVEX_URL || import.meta.env.VITE_CONVEX_URL
@@ -49,6 +61,86 @@ export default {
       }
       const execution = await runTimeLeakPipeline(input)
       return Response.json(execution, { status: execution.result.status === 'pass' ? 200 : 422 })
+    }
+
+    if (url.pathname === '/api/transcribe-schedule' && request.method === 'POST') {
+      if (!env.ELEVENLABS_API_KEY) return Response.json({ error: 'VOICE_NOT_CONFIGURED' }, { status: 503 })
+      try {
+        const form = await request.formData()
+        const audio = form.get('audio')
+        if (!(audio instanceof File)) return Response.json({ error: 'AUDIO_REQUIRED' }, { status: 400 })
+        const transcript = await transcribeScheduleAudio(audio, { apiKey: env.ELEVENLABS_API_KEY })
+        return Response.json(transcript, { headers: { 'cache-control': 'no-store' } })
+      } catch (error) {
+        const code = error instanceof Error ? error.message : 'TRANSCRIPTION_FAILED'
+        const status = ['EMPTY_AUDIO', 'AUDIO_TOO_LARGE'].includes(code) ? 400 : 502
+        return Response.json({ error: code }, { status, headers: { 'cache-control': 'no-store' } })
+      }
+    }
+
+    if (url.pathname === '/api/interpret-schedule' && request.method === 'POST') {
+      if (!env.OPENAI_API_KEY) return Response.json({ error: 'SCHEDULE_AI_NOT_CONFIGURED' }, { status: 503 })
+      let transcript = ''
+      try {
+        const body = await request.json() as { transcript?: unknown }
+        transcript = typeof body.transcript === 'string' ? body.transcript : ''
+      } catch {
+        return Response.json({ error: 'INVALID_TRANSCRIPT' }, { status: 400 })
+      }
+      try {
+        const schedule = await interpretScheduleTranscript(transcript, { apiKey: env.OPENAI_API_KEY })
+        return Response.json(schedule, { headers: { 'cache-control': 'no-store' } })
+      } catch (error) {
+        const code = error instanceof Error ? error.message : 'SCHEDULE_INTERPRETATION_FAILED'
+        const status = ['EMPTY_TRANSCRIPT', 'TRANSCRIPT_TOO_LARGE', 'NO_EXPLICIT_SCHEDULE_BLOCKS', 'OVERLAPPING_SCHEDULE'].includes(code) ? 422 : 502
+        return Response.json({ error: code }, { status, headers: { 'cache-control': 'no-store' } })
+      }
+    }
+
+    if (url.pathname === '/api/briefing' && request.method === 'POST') {
+      if (!env.ELEVENLABS_API_KEY || !env.ELEVENLABS_VOICE_ID) {
+        return Response.json({ error: 'VOICE_NOT_CONFIGURED' }, { status: 503 })
+      }
+      let result: unknown
+      try {
+        result = await request.json()
+      } catch {
+        return Response.json({ error: 'JUDGE_APPROVED_RESULT_REQUIRED' }, { status: 400 })
+      }
+      const validation = validateAnalysisResult(result)
+      if (!validation.valid || (result as TimeLeakAnalysis).status !== 'pass') {
+        return Response.json({ error: 'JUDGE_APPROVED_RESULT_REQUIRED' }, { status: 400 })
+      }
+      const approved = result as TimeLeakAnalysis
+      const analysisId = await analysisCacheId(approved)
+      const cacheKey = new Request(`${url.origin}/api/briefing-cache/${analysisId}`)
+      const cache = caches.default
+      const cached = await cache.match(cacheKey)
+      if (cached) {
+        const headers = new Headers(cached.headers)
+        headers.set('x-analysis-id', analysisId)
+        headers.set('x-audio-cache', 'hit')
+        return new Response(cached.body, { headers })
+      }
+      try {
+        const generated = await createBriefingAudio(approved, {
+          apiKey: env.ELEVENLABS_API_KEY,
+          voiceId: env.ELEVENLABS_VOICE_ID,
+        })
+        const audio = new Response(generated.body, {
+          headers: {
+            'content-type': generated.headers.get('content-type') || 'audio/mpeg',
+            'cache-control': 'private, max-age=31536000',
+            'x-analysis-id': analysisId,
+            'x-audio-cache': 'miss',
+          },
+        })
+        await cache.put(cacheKey, audio.clone())
+        return audio
+      } catch (error) {
+        console.error('ElevenLabs briefing failed', error)
+        return Response.json({ error: 'BRIEFING_UNAVAILABLE' }, { status: 502 })
+      }
     }
 
     if (url.pathname === '/api/checkout' && request.method === 'POST') {

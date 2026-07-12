@@ -11,6 +11,9 @@ function createBackend() {
     createUser: vi.fn().mockResolvedValue({ userId: 'user-1', created: true }),
     trackEvent: vi.fn().mockResolvedValue(undefined),
     analyze: vi.fn().mockImplementation(() => runTimeLeakPipeline(MONDAY_PIPELINE_INPUT)),
+    transcribeSchedule: vi.fn().mockResolvedValue({ text: '9:00 AM - 10:00 AM: Team meeting', languageCode: 'eng' }),
+    interpretSchedule: vi.fn().mockResolvedValue({ scheduleText: '9:00 AM - 10:00 AM: Team meeting' }),
+    getBriefingAudio: vi.fn().mockResolvedValue(new Blob(['audio'], { type: 'audio/mpeg' })),
     startCheckout: vi.fn().mockResolvedValue({
       mode: 'demo',
       amountUsdCents: 999,

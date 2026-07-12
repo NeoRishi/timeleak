@@ -1,4 +1,4 @@
-export type ScheduleMethod = '' | 'demo' | 'paste' | 'screenshot'
+export type ScheduleMethod = '' | 'demo' | 'paste' | 'voice' | 'screenshot'
 export type PriorityCategory = '' | 'Health' | 'Family' | 'Learning' | 'Personal project' | 'Creative work' | 'Other'
 
 export type ScheduleEvent = {

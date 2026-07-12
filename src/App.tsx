@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   formatClock,
   hashSessionId,
@@ -69,6 +69,9 @@ export type OnboardingBackend = {
     sessionId?: string,
   ) => Promise<unknown>
   analyze: (input: PipelineInput) => Promise<PipelineExecution>
+  transcribeSchedule: (audio: File) => Promise<{ text: string; languageCode?: string }>
+  interpretSchedule: (transcript: string) => Promise<{ scheduleText: string }>
+  getBriefingAudio: (result: PipelineExecution['result']) => Promise<Blob>
   startCheckout: (input: { userId: string; email: string }) => Promise<CheckoutResult>
   getPaymentState: (userId: string) => Promise<PaymentState>
   requestRefund: (input: { userId: string; paymentId: string }) => Promise<unknown>
@@ -78,6 +81,9 @@ const offlineBackend: OnboardingBackend = {
   createUser: async () => ({ userId: 'local-preview', created: true }),
   trackEvent: async () => undefined,
   analyze: (input) => runTimeLeakPipeline(input),
+  transcribeSchedule: async () => { throw new Error('VOICE_NOT_CONFIGURED') },
+  interpretSchedule: async () => { throw new Error('SCHEDULE_AI_NOT_CONFIGURED') },
+  getBriefingAudio: async () => { throw new Error('VOICE_NOT_CONFIGURED') },
   startCheckout: async ({ email }) => ({
     mode: 'demo',
     amountUsdCents: 999,
@@ -361,10 +367,18 @@ function App({ backend = offlineBackend }: { backend?: OnboardingBackend }) {
               <div className="method-grid">
                 <MethodCard title="Use the Monday demo" description="Fastest path · ready in one tap" badge="Recommended" selected={state.scheduleMethod === 'demo'} onClick={() => chooseMethod('demo')} />
                 <MethodCard title="Paste tomorrow’s events" description="One time range and event per line" selected={state.scheduleMethod === 'paste'} onClick={() => chooseMethod('paste')} />
+                <MethodCard title="Speak tomorrow’s schedule" description="Record, review, and edit the transcript" badge="ElevenLabs" selected={state.scheduleMethod === 'voice'} onClick={() => chooseMethod('voice')} />
                 <MethodCard title="Upload a screenshot" description="Preview only · OCR is not active yet" badge="Coming later" selected={state.scheduleMethod === 'screenshot'} onClick={() => chooseMethod('screenshot')} />
               </div>
 
               {state.scheduleMethod === 'demo' && <SchedulePreview events={MONDAY_DEMO_EVENTS} label="Monday, 13 July · 9 events loaded" />}
+              {state.scheduleMethod === 'voice' && (
+                <VoiceScheduleInput
+                  backend={backend}
+                  transcript={state.pastedSchedule}
+                  onTranscript={(text) => update({ pastedSchedule: text })}
+                />
+              )}
               {state.scheduleMethod === 'paste' && (
                 <div className="paste-panel">
                   <label className="field-label" htmlFor="schedule-lines">Schedule lines</label>
@@ -379,6 +393,8 @@ function App({ backend = offlineBackend }: { backend?: OnboardingBackend }) {
                   {[...parsedSchedule.errors, ...parsedSchedule.overlaps].map((message) => <p className="inline-error" role="alert" key={message}>{message}</p>)}
                 </div>
               )}
+              {state.scheduleMethod === 'voice' && parsedSchedule.events.length > 0 && <SchedulePreview events={parsedSchedule.events} label={`${parsedSchedule.events.length} spoken events parsed`} />}
+              {state.scheduleMethod === 'voice' && [...parsedSchedule.errors, ...parsedSchedule.overlaps].map((message) => <p className="inline-error" role="alert" key={message}>{message}</p>)}
               {state.scheduleMethod === 'screenshot' && <p className="truth-note">Screenshot OCR is not enabled. We will never pretend an image was read when it was not.</p>}
               <ErrorMessage message={error} />
               <div className="flow-actions">
@@ -387,7 +403,7 @@ function App({ backend = offlineBackend }: { backend?: OnboardingBackend }) {
                   className="continue-button"
                   type="button"
                   onClick={submitSchedule}
-                  disabled={state.scheduleMethod === 'screenshot' || (state.scheduleMethod === 'paste' && (parsedSchedule.events.length === 0 || parsedSchedule.errors.length > 0 || parsedSchedule.overlaps.length > 0))}
+                  disabled={state.scheduleMethod === 'screenshot' || ((state.scheduleMethod === 'paste' || state.scheduleMethod === 'voice') && (parsedSchedule.events.length === 0 || parsedSchedule.errors.length > 0 || parsedSchedule.overlaps.length > 0))}
                 >Continue</button>
               </div>
             </div>
@@ -438,6 +454,9 @@ export function ResultView({ analysis, backend, userId, email }: {
   const [paymentState, setPaymentState] = useState<PaymentState | null>(null)
   const [refundBusy, setRefundBusy] = useState(false)
   const [refundMessage, setRefundMessage] = useState('')
+  const [briefingUrl, setBriefingUrl] = useState('')
+  const [briefingBusy, setBriefingBusy] = useState(false)
+  const [briefingMessage, setBriefingMessage] = useState('')
 
   useEffect(() => {
     let active = true
@@ -446,6 +465,22 @@ export function ResultView({ analysis, backend, userId, email }: {
     }).catch(() => undefined)
     return () => { active = false }
   }, [backend, userId])
+
+  useEffect(() => () => { if (briefingUrl) URL.revokeObjectURL(briefingUrl) }, [briefingUrl])
+
+  async function loadBriefing() {
+    setBriefingBusy(true)
+    setBriefingMessage('')
+    try {
+      const blob = await backend.getBriefingAudio(result)
+      setBriefingUrl(URL.createObjectURL(blob))
+      setBriefingMessage('Your private, dynamic briefing is ready.')
+    } catch {
+      setBriefingMessage('Audio is not available yet. Your written repair remains ready.')
+    } finally {
+      setBriefingBusy(false)
+    }
+  }
 
   async function requestRefund() {
     if (!paymentState?.payment) return
@@ -561,9 +596,17 @@ export function ResultView({ analysis, backend, userId, email }: {
           <div><p className="card-label">Download calendar block</p><h2>{calendar?.title}</h2><span>Ready to add to your calendar.</span></div>
           <button type="button" className="result-button" onClick={downloadCalendar}>Download .ics file</button>
         </div>
-        <div className="action-row disabled-action">
-          <div><p className="card-label">Tomorrow Briefing</p><h2>Hear your repair in 30 seconds</h2><span>Available when dynamic audio is connected.</span></div>
-          <button type="button" className="result-button secondary" disabled>Play briefing</button>
+        <div className="action-row">
+          <div>
+            <p className="card-label">Tomorrow Briefing</p>
+            <h2>Hear your repair in about 30 seconds</h2>
+            <span>Generated from this judge-approved result without narrating your full schedule.</span>
+            {briefingMessage && <em role="status">{briefingMessage}</em>}
+          </div>
+          <div>
+            {!briefingUrl && <button type="button" className="result-button secondary" onClick={loadBriefing} disabled={briefingBusy}>{briefingBusy ? 'Creating briefing…' : 'Create audio briefing'}</button>}
+            {briefingUrl && <audio controls src={briefingUrl} aria-label="Tomorrow Briefing" />}
+          </div>
         </div>
         <div className="action-row share-row">
           <div><p className="card-label">Privacy-safe share card</p><h2>{result.shareResult.afterMinutes} minutes tomorrow · {result.shareResult.monthlyHours} hours next month</h2><span>Only reclaimed metrics and the public leak label are shared.</span>{copyStatus && <em role="status">{copyStatus}</em>}</div>
@@ -614,6 +657,108 @@ export function ResultView({ analysis, backend, userId, email }: {
 
       {repairedBlocks.length > 0 && <p className="result-footnote">Repair checked against {repairedBlocks.length} non-overlapping blocks.</p>}
     </article>
+  )
+}
+
+function VoiceScheduleInput({ backend, transcript, onTranscript }: {
+  backend: OnboardingBackend
+  transcript: string
+  onTranscript: (text: string) => void
+}) {
+  const recorderRef = useRef<MediaRecorder | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const chunksRef = useRef<Blob[]>([])
+  const [recording, setRecording] = useState(false)
+  const [transcribing, setTranscribing] = useState(false)
+  const [interpreting, setInterpreting] = useState(false)
+  const [rawTranscript, setRawTranscript] = useState('')
+  const [message, setMessage] = useState('')
+
+  useEffect(() => () => streamRef.current?.getTracks().forEach((track) => track.stop()), [])
+
+  async function interpretTranscript(text = rawTranscript) {
+    const clean = text.trim()
+    if (!clean) return setMessage('Record or enter your schedule description first.')
+    setInterpreting(true)
+    try {
+      const result = await backend.interpretSchedule(clean)
+      onTranscript(result.scheduleText)
+      setMessage('Schedule blocks are ready. Check every time and edit anything that was misheard or misunderstood.')
+    } catch {
+      setMessage('We need clearer start and end times. Edit the transcript or enter schedule lines manually below.')
+    } finally {
+      setInterpreting(false)
+    }
+  }
+
+  async function startRecording() {
+    setMessage('')
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      setMessage('Voice recording is not supported here. Paste your schedule instead.')
+      return
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const recorder = new MediaRecorder(stream)
+      streamRef.current = stream
+      recorderRef.current = recorder
+      chunksRef.current = []
+      recorder.ondataavailable = (event) => { if (event.data.size) chunksRef.current.push(event.data) }
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop())
+        setRecording(false)
+        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' })
+        if (!blob.size) return setMessage('No speech was captured. Please try again.')
+        setTranscribing(true)
+        try {
+          const extension = blob.type.includes('mp4') ? 'm4a' : 'webm'
+          const result = await backend.transcribeSchedule(new File([blob], `schedule.${extension}`, { type: blob.type }))
+          setRawTranscript(result.text)
+          await interpretTranscript(result.text)
+        } catch {
+          setMessage('We could not transcribe that recording. Try again or paste your schedule.')
+        } finally {
+          setTranscribing(false)
+        }
+      }
+      recorder.start()
+      setRecording(true)
+    } catch {
+      setMessage('Microphone access was not granted. You can still paste your schedule.')
+    }
+  }
+
+  function stopRecording() {
+    if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
+  }
+
+  return (
+    <div className="paste-panel voice-panel">
+      <p className="field-label">Speak your schedule</p>
+      <p className="field-help">Say explicit start and end times. Your recording is sent privately for transcription and is not kept by TimeLeak.</p>
+      <button className="result-button" type="button" onClick={recording ? stopRecording : startRecording} disabled={transcribing || interpreting}>
+        {transcribing ? 'Transcribing…' : interpreting ? 'Understanding schedule…' : recording ? 'Stop and transcribe' : 'Start recording'}
+      </button>
+      {recording && <p role="status">Recording… speak for up to two minutes.</p>}
+      {message && <p role="status">{message}</p>}
+      <label className="field-label" htmlFor="voice-transcript">Editable speech transcript</label>
+      <textarea
+        id="voice-transcript"
+        value={rawTranscript}
+        onChange={(event) => setRawTranscript(event.target.value)}
+        placeholder="I commute from eight to nine, work from nine to six, and have dinner from seven to eight."
+      />
+      <button className="result-button secondary" type="button" onClick={() => interpretTranscript()} disabled={interpreting || !rawTranscript.trim()}>
+        {interpreting ? 'Understanding schedule…' : 'Interpret edited transcript'}
+      </button>
+      <label className="field-label" htmlFor="voice-schedule-lines">Structured schedule — review before continuing</label>
+      <textarea
+        id="voice-schedule-lines"
+        value={transcript}
+        onChange={(event) => onTranscript(event.target.value)}
+        placeholder={'9:00 AM - 10:00 AM: Team meeting\n10:30 AM - 12:00 PM: Focus work'}
+      />
+    </div>
   )
 }
 

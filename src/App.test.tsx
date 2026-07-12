@@ -4,13 +4,21 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MONDAY_PIPELINE_INPUT, runTimeLeakPipeline } from './timeleakPipeline'
-import App, { type OnboardingBackend } from './App'
+import App, { ResultView, type OnboardingBackend, type PaymentState } from './App'
 
 function createBackend() {
   return {
     createUser: vi.fn().mockResolvedValue({ userId: 'user-1', created: true }),
     trackEvent: vi.fn().mockResolvedValue(undefined),
     analyze: vi.fn().mockImplementation(() => runTimeLeakPipeline(MONDAY_PIPELINE_INPUT)),
+    startCheckout: vi.fn().mockResolvedValue({
+      mode: 'demo',
+      amountUsdCents: 999,
+      customerEmail: 'tester@example.com',
+      checkoutUrl: 'https://timeleak.example/checkout/demo?amount=999',
+    }),
+    getPaymentState: vi.fn().mockResolvedValue({ accessStatus: 'free', payment: null, refundRequest: null }),
+    requestRefund: vi.fn().mockResolvedValue(undefined),
   } satisfies OnboardingBackend
 }
 
@@ -182,8 +190,48 @@ describe('Phase 3 onboarding', () => {
     expect(sharedText).not.toContain('8:30')
     expect(await screen.findByRole('status')).toHaveTextContent('private schedule details were excluded')
 
+    await userEvent.click(screen.getByRole('button', { name: 'Start 30-Day Time Reclaim — $9.99' }))
+    expect(await screen.findByRole('heading', { name: 'Dodo demo checkout' })).toBeInTheDocument()
+    expect(screen.getByText('$9.99 one-time payment')).toBeInTheDocument()
+    expect(screen.getByText('tester@example.com')).toBeInTheDocument()
+    expect(screen.getByText('No payment will be collected and access will not be granted.')).toBeInTheDocument()
+    expect(backend.startCheckout).toHaveBeenCalledWith({ userId: 'user-1', email: 'tester@example.com' })
+    await userEvent.click(screen.getByRole('button', { name: 'Return without payment' }))
+    expect(screen.queryByRole('heading', { name: 'Dodo demo checkout' })).not.toBeInTheDocument()
+    expect(screen.queryByText('30-day access active')).not.toBeInTheDocument()
+
     first.unmount()
     render(<App backend={backend} />)
     expect(await screen.findByRole('heading', { name: 'We found your TimeLeak.' })).toBeInTheDocument()
+  })
+
+  it('shows the exact refund deadline and keeps access until refund confirmation', async () => {
+    const execution = await runTimeLeakPipeline(MONDAY_PIPELINE_INPUT)
+    const backend = createBackend()
+    const paidAt = Date.UTC(2026, 6, 13, 12)
+    const paymentState: PaymentState = {
+      accessStatus: 'paid',
+      accessUntil: paidAt + 30 * 86_400_000,
+      payment: {
+        id: 'payment-1',
+        status: 'paid',
+        amountUsdCents: 999,
+        mode: 'test',
+        paidAt,
+        refundDeadline: paidAt + 7 * 86_400_000,
+      },
+      refundRequest: null,
+    }
+    backend.getPaymentState.mockResolvedValue(paymentState)
+
+    render(<ResultView analysis={execution} backend={backend} userId="user-1" email="tester@example.com" />)
+
+    expect(await screen.findByRole('heading', { name: '30-day access active' })).toBeInTheDocument()
+    expect(screen.getByText(/2026-07-20T12:00:00 UTC/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Start 30-Day Time Reclaim — $9.99' })).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Request Refund' }))
+    expect(backend.requestRefund).toHaveBeenCalledWith({ userId: 'user-1', paymentId: 'payment-1' })
+    expect(await screen.findByText(/access remains active until Dodo confirms the refund/)).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '30-day access active' })).toBeInTheDocument()
   })
 })

@@ -35,6 +35,27 @@ export type InstrumentationEvent =
   | 'schedule_parsed'
   | 'priority_submitted'
 
+export type CheckoutResult = {
+  mode: 'demo' | 'test' | 'live'
+  amountUsdCents: 999
+  customerEmail: string
+  checkoutUrl: string
+}
+
+export type PaymentState = {
+  accessStatus: 'free' | 'paid' | 'refunded'
+  accessUntil?: number
+  payment: null | {
+    id: string
+    status: 'pending' | 'paid' | 'failed' | 'refunded'
+    amountUsdCents: number
+    mode: 'demo' | 'test' | 'live'
+    paidAt?: number
+    refundDeadline?: number
+  }
+  refundRequest: null | { status: 'requested' | 'processing' | 'completed' | 'rejected'; requestedAt: number }
+}
+
 export type OnboardingBackend = {
   createUser: (input: {
     email: string
@@ -48,12 +69,23 @@ export type OnboardingBackend = {
     sessionId?: string,
   ) => Promise<unknown>
   analyze: (input: PipelineInput) => Promise<PipelineExecution>
+  startCheckout: (input: { userId: string; email: string }) => Promise<CheckoutResult>
+  getPaymentState: (userId: string) => Promise<PaymentState>
+  requestRefund: (input: { userId: string; paymentId: string }) => Promise<unknown>
 }
 
 const offlineBackend: OnboardingBackend = {
   createUser: async () => ({ userId: 'local-preview', created: true }),
   trackEvent: async () => undefined,
   analyze: (input) => runTimeLeakPipeline(input),
+  startCheckout: async ({ email }) => ({
+    mode: 'demo',
+    amountUsdCents: 999,
+    customerEmail: email,
+    checkoutUrl: `${window.location.origin}/checkout/demo?amount=999`,
+  }),
+  getPaymentState: async () => ({ accessStatus: 'free', payment: null, refundRequest: null }),
+  requestRefund: async () => undefined,
 }
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -383,16 +415,68 @@ function App({ backend = offlineBackend }: { backend?: OnboardingBackend }) {
             </form>
           )}
 
-          {state.step === 5 && analysis && <ResultView analysis={analysis} />}
+          {state.step === 5 && analysis && (
+            <ResultView analysis={analysis} backend={backend} userId={state.userId} email={state.email} />
+          )}
         </section>
       )}
     </main>
   )
 }
 
-function ResultView({ analysis }: { analysis: Pick<PipelineExecution, 'result' | 'repairedBlocks'> }) {
+export function ResultView({ analysis, backend, userId, email }: {
+  analysis: Pick<PipelineExecution, 'result' | 'repairedBlocks'>
+  backend: OnboardingBackend
+  userId: string
+  email: string
+}) {
   const { result, repairedBlocks } = analysis
   const [copyStatus, setCopyStatus] = useState('')
+  const [checkout, setCheckout] = useState<CheckoutResult | null>(null)
+  const [checkoutError, setCheckoutError] = useState('')
+  const [checkoutBusy, setCheckoutBusy] = useState(false)
+  const [paymentState, setPaymentState] = useState<PaymentState | null>(null)
+  const [refundBusy, setRefundBusy] = useState(false)
+  const [refundMessage, setRefundMessage] = useState('')
+
+  useEffect(() => {
+    let active = true
+    backend.getPaymentState(userId).then((next) => {
+      if (active) setPaymentState(next)
+    }).catch(() => undefined)
+    return () => { active = false }
+  }, [backend, userId])
+
+  async function requestRefund() {
+    if (!paymentState?.payment) return
+    setRefundBusy(true)
+    try {
+      await backend.requestRefund({ userId, paymentId: paymentState.payment.id })
+      setPaymentState({
+        ...paymentState,
+        refundRequest: { status: 'requested', requestedAt: Date.now() },
+      })
+      setRefundMessage('Refund requested. It may be processed manually; access remains active until Dodo confirms the refund.')
+    } catch {
+      setRefundMessage('We could not submit the refund request. Please try again.')
+    } finally {
+      setRefundBusy(false)
+    }
+  }
+
+  async function beginCheckout() {
+    setCheckoutBusy(true)
+    setCheckoutError('')
+    try {
+      const created = await backend.startCheckout({ userId, email })
+      if (created.mode === 'demo') setCheckout(created)
+      else window.location.assign(created.checkoutUrl)
+    } catch {
+      setCheckoutError('Checkout is temporarily unavailable. Your result is still saved.')
+    } finally {
+      setCheckoutBusy(false)
+    }
+  }
   const summary = result.daySummary
   const allocation = [
     ['Sleep', summary.sleepMinutes, 'sleep'],
@@ -487,15 +571,46 @@ function ResultView({ analysis }: { analysis: Pick<PipelineExecution, 'result' |
         </div>
       </section>
 
-      <section className="offer-card">
+      {paymentState?.accessStatus === 'paid' && paymentState.payment && (
+        <section className="paid-account" aria-labelledby="paid-account-title">
+          <p className="offer-kicker">Paid account</p>
+          <h2 id="paid-account-title">30-day access active</h2>
+          <p>Access ends: <strong>{new Date(paymentState.accessUntil || 0).toISOString().replace('.000Z', ' UTC')}</strong></p>
+          <p>Refund deadline: <strong>{new Date(paymentState.payment.refundDeadline || 0).toISOString().replace('.000Z', ' UTC')}</strong></p>
+          {paymentState.refundRequest
+            ? <p role="status">Refund request status: {paymentState.refundRequest.status}. Access changes only after Dodo confirms the refund.</p>
+            : <button type="button" onClick={requestRefund} disabled={refundBusy}>{refundBusy ? 'Submitting request…' : 'Request Refund'}</button>}
+          {refundMessage && <p role="status">{refundMessage}</p>}
+        </section>
+      )}
+
+      {paymentState?.accessStatus !== 'paid' && <section className="offer-card">
         <div>
           <p className="offer-kicker">30-Day Time Reclaim Pass</p>
           <h2>One repaired day shows the opportunity. Protect the next 30 days.</h2>
           <p>Daily change-only check-ins, one calendar-ready repair, and weekly reclaimed-hours evidence.</p>
           <small>Immediate access. Cancel within seven days for a full refund.</small>
         </div>
-        <div className="offer-action"><strong>$9.99</strong><span>one-time payment</span><button type="button">Start 30-Day Time Reclaim — $9.99</button></div>
-      </section>
+        <div className="offer-action">
+          <strong>$9.99</strong><span>one-time payment</span>
+          <button type="button" onClick={beginCheckout} disabled={checkoutBusy}>
+            {checkoutBusy ? 'Opening secure checkout…' : 'Start 30-Day Time Reclaim — $9.99'}
+          </button>
+          {checkoutError && <em role="alert">{checkoutError}</em>}
+        </div>
+      </section>}
+
+      {checkout?.mode === 'demo' && (
+        <section className="demo-checkout" aria-labelledby="demo-checkout-title">
+          <p className="offer-kicker">Dodo Payments integration preview</p>
+          <h2 id="demo-checkout-title">Dodo demo checkout</h2>
+          <strong>$9.99 one-time payment</strong>
+          <p>{checkout.customerEmail}</p>
+          <p>No payment will be collected and access will not be granted.</p>
+          <p>This screen will redirect to Dodo test or live checkout as soon as your product ID and API key are configured.</p>
+          <button type="button" onClick={() => setCheckout(null)}>Return without payment</button>
+        </section>
+      )}
 
       {repairedBlocks.length > 0 && <p className="result-footnote">Repair checked against {repairedBlocks.length} non-overlapping blocks.</p>}
     </article>

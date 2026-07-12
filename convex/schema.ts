@@ -81,7 +81,10 @@ export default defineSchema({
     userId: v.id('users'),
     provider: v.literal('dodo'),
     providerPaymentId: v.string(),
+    checkoutSessionId: v.string(),
+    customerEmail: v.string(),
     amountUsdCents: v.number(),
+    mode: v.union(v.literal('demo'), v.literal('test'), v.literal('live')),
     status: v.union(
       v.literal('pending'),
       v.literal('paid'),
@@ -94,6 +97,13 @@ export default defineSchema({
   })
     .index('by_provider_payment', ['providerPaymentId'])
     .index('by_user', ['userId']),
+
+  paymentWebhookEvents: defineTable({
+    webhookId: v.string(),
+    eventType: v.string(),
+    providerPaymentId: v.string(),
+    processedAt: v.number(),
+  }).index('by_webhook_id', ['webhookId']),
 
   refundRequests: defineTable({
     userId: v.id('users'),

@@ -11,6 +11,7 @@
 import type * as analyses from "../analyses.js";
 import type * as dayProfiles from "../dayProfiles.js";
 import type * as events from "../events.js";
+import type * as payments from "../payments.js";
 import type * as proof from "../proof.js";
 import type * as shares from "../shares.js";
 import type * as users from "../users.js";
@@ -25,6 +26,7 @@ declare const fullApi: ApiFromModules<{
   analyses: typeof analyses;
   dayProfiles: typeof dayProfiles;
   events: typeof events;
+  payments: typeof payments;
   proof: typeof proof;
   shares: typeof shares;
   users: typeof users;

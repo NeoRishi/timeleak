@@ -4,7 +4,7 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "timeleak-app",
+	"name": "timeleak",
 	"main": "worker/index.ts",
 	"compatibility_date": "2026-07-12",
 	"assets": {
